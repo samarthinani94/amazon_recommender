@@ -172,3 +172,22 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+
+# large files
+*.csv
+*.tsv
+*.json
+*.parquet
+*.xlsx
+*.xls
+*.hdf5
+*.h5
+*.hdf
+*jsonl
+*.pkl
+
+# virutal env folder
+amz/*
+.tool-versions
+.DS_Store*

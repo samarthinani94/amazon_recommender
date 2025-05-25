@@ -1,0 +1,6 @@
+Train has multiple rows per user. Say a user made 5 purchases
+Row 1 will have first purchase data and history col will be null
+Row 2 will have second purchase data and history col will have the first purchase item id
+
+
+
