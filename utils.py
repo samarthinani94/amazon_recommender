@@ -1,0 +1,1 @@
+root_path = '/Users/samarthinani/Git_projects/amazon_recommender'
