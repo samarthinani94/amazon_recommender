@@ -186,6 +186,7 @@ cython_debug/
 *.hdf
 *jsonl
 *.pkl
+*.pth
 
 # virutal env folder
 amz/*
