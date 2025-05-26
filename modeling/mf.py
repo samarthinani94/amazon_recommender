@@ -8,6 +8,8 @@ import pickle
 import time
 import os
 from tqdm import tqdm
+from sklearn.metrics import root_mean_squared_error
+from torch.optim.lr_scheduler import CyclicLR
 
 # from utils import root_path
 root_path = '/Users/samarthinani/Git_projects/amazon_recommender'
@@ -93,11 +95,9 @@ def load_data(folder_path):
     user_ids = []
     item_ids = []
     ratings = []
-
-    train_folder = os.path.join(folder_path, "train")
-    for file_name in os.listdir(train_folder):
+    for file_name in os.listdir(folder_path):
         if file_name.endswith('.csv'):
-            file_path = os.path.join(train_folder, file_name)
+            file_path = os.path.join(folder_path, file_name)
             print(f"Processing file: {file_name}")
             df = pd.read_csv(file_path)
             df = detrend_ratings(df)
@@ -112,15 +112,17 @@ def get_indices(df):
     uid2idx = {uid: idx for idx, uid in enumerate(df['user_id'].unique())}
     iid2idx = {iid: idx for idx, iid in enumerate(df['item_id'].unique())}
     return uid2idx, iid2idx
-    
-    
-def train_model(model, train_loader, criterion, optimizer, num_epochs=10):
-    """
-    Train the matrix factorization model.
-    """
-    for epoch in tqdm(range(num_epochs)):
+
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=10, patience=3):
+    best_val_loss = float('inf')
+    counter = 0
+
+    for epoch in range(num_epochs):
+        start_time = time.time()
         model.train()
-        total_loss = 0
+        train_preds, train_targets = [], []
+        train_loss = 0
+
         for user_indices, item_indices, ratings in train_loader:
             user_indices = user_indices.to(device)
             item_indices = item_indices.to(device)
@@ -131,11 +133,50 @@ def train_model(model, train_loader, criterion, optimizer, num_epochs=10):
             loss = criterion(outputs, ratings)
             loss.backward()
             optimizer.step()
+            scheduler.step()
 
-            total_loss += loss.item()
+            train_loss += loss.item()
+            train_preds.extend(outputs.detach().cpu().numpy())
+            train_targets.extend(ratings.cpu().numpy())
 
-        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {total_loss/len(train_loader):.4f}")
+        train_rmse = root_mean_squared_error(train_targets, train_preds)
+
+        # Validation phase
+        model.eval()
+        val_preds, val_targets = [], []
+        val_loss = 0
+
+        with torch.no_grad():
+            for user_indices, item_indices, ratings in val_loader:
+                user_indices = user_indices.to(device)
+                item_indices = item_indices.to(device)
+                ratings = ratings.float().to(device)
+
+                outputs = model(user_indices, item_indices)
+                loss = criterion(outputs, ratings)
+                val_loss += loss.item()
+
+                val_preds.extend(outputs.cpu().numpy())
+                val_targets.extend(ratings.cpu().numpy())
+
+        val_rmse = root_mean_squared_error(val_targets, val_preds)
+        current_lr = scheduler.get_last_lr()[0]
+        end_time = time.time()
+        print(f"Epoch {epoch+1}/{num_epochs} - LR: {current_lr:.6f} - Train RMSE: {train_rmse:.4f} - Val RMSE: {val_rmse:.4f} - Time: {end_time - start_time:.2f}s")
+
+        # Early Stopping Check
+        if val_rmse < best_val_loss:
+            best_val_loss = val_rmse
+            counter = 0
+            torch.save(model.state_dict(), "best_model.pth")
+        else:
+            counter += 1
+            if counter >= patience:
+                print(f"Early stopping triggered at epoch {epoch+1}")
+                break
+
     return model
+
 
 def save_model(model, file_path):
     """
@@ -144,23 +185,44 @@ def save_model(model, file_path):
     torch.save(model.state_dict(), file_path)
     print(f"Model saved to {file_path}")
     
-    
-    
-folder_path = os.path.join(root_path, "data", "processed")
-user_ids, item_ids, ratings = load_data(folder_path)
 
-# Detrend the ratings
-df_all = pd.DataFrame({'user_id': user_ids, 'item_id': item_ids, 'rating': ratings})
-df = df_all.copy()
+batch_size = 1024
+# ---------------------------------------------------------------------------
+train_folder_path = os.path.join(root_path, "data", "processed", "train")
+user_ids, item_ids, ratings = load_data(train_folder_path)
+
+train_df_all = pd.DataFrame({'user_id': user_ids, 'item_id': item_ids, 'rating': ratings})
+df = train_df_all.copy()
 
 uid2idx, iid2idx = get_indices(df)
 df['user_id'] = df['user_id'].map(uid2idx)
 df['item_id'] = df['item_id'].map(iid2idx)
 
-# Prepare the dataset and dataloader
-dataset = RatingDataset(df['user_id'].values, df['item_id'].values, df['rating'].values)
-train_loader = DataLoader(dataset, batch_size=8192, shuffle=True)
-print(f"Number of training samples: {len(dataset)}")
+# Prepare the train dataset and dataloader
+train_dataset = RatingDataset(df['user_id'].values, df['item_id'].values, df['rating'].values)
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+print(f"Number of training samples: {len(train_dataset)}")
+
+# ---------------------------------------------------------------------------
+valid_folder_path = os.path.join(root_path, "data", "raw", "valid")
+user_ids_valid, item_ids_valid, ratings_valid = load_data(valid_folder_path)
+
+valid_df_all = pd.DataFrame({'user_id': user_ids_valid, 'item_id': item_ids_valid, 'rating': ratings_valid})
+
+# Ensure that the validation data contains only users and items present in the training data
+valid_df_all = valid_df_all.loc[valid_df_all['user_id'].isin(uid2idx.keys()) & valid_df_all['item_id'].isin(iid2idx.keys())]
+valid_df_all = valid_df_all.reset_index(drop=True)
+
+valid_df_all['user_id'] = valid_df_all['user_id'].map(uid2idx)
+valid_df_all['item_id'] = valid_df_all['item_id'].map(iid2idx)
+valid_df = valid_df_all.copy()
+
+# Prepare validation dataset and dataloader
+valid_dataset = RatingDataset(valid_df['user_id'].values, valid_df['item_id'].values, valid_df['rating'].values)
+valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False)
+print(f"Number of validation samples: {len(valid_dataset)}")
+
+# ---------------------------------------------------------------------------
 
 # Initialize the model, loss function, and optimizer
 num_users = df.user_id.nunique()
@@ -171,12 +233,36 @@ print("model initialized with {} users and {} items.".format(num_users, num_item
 criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 
+iterations_per_epoch = len(train_loader)
+step_size_val = 4 * iterations_per_epoch
+
+scheduler = CyclicLR(
+    optimizer, 
+    base_lr=1e-4,      # Minimum LR
+    max_lr=5e-3,       # Peak LR
+    step_size_up=step_size_val,  # Number of training steps to increase LR
+    mode='triangular',  # Better for stable convergence
+    cycle_momentum=False  # Required with Adam
+)
+
+# load an existing model if available
+model_path = "best_model.pth"
+try:
+    model.load_state_dict(torch.load(model_path))
+    print(f"Successfully loaded weights from {model_path}")
+except Exception as e:
+    print(f"Error loading weights from {model_path}: {e}")
+    print("Starting with a fresh model.")
+    
+model = model.to(device)
+print("Model ready on device:", device)
+
 # Train the model
 print("Starting training...")
-trained_model = train_model(model, train_loader, criterion, optimizer, num_epochs=5)
+trained_model = train_model(model, train_loader, valid_loader, criterion, optimizer, scheduler, num_epochs=100, patience=5)
 
 # Save the trained model 
-print("Training complete. Saving the model...")
-model_save_path = os.path.join(root_path, "models", "mf", "mf_model.pth")
-save_model(trained_model, model_save_path)
+# print("Training complete. Saving the model...")
+# model_save_path = os.path.join(root_path, "models", "mf", "mf_model.pth")
+# save_model(trained_model, model_save_path)
 
