@@ -10,10 +10,11 @@ import os
 from tqdm import tqdm
 from sklearn.metrics import root_mean_squared_error
 from torch.optim.lr_scheduler import CyclicLR
+import torch.nn.functional as F
+from utils import root_path
 
 # from utils import root_path
 root_path = '/Users/samarthinani/Git_projects/amazon_recommender'
-from pathlib import Path
 
 #  Device configuration
 if torch.backends.mps.is_available():
@@ -30,26 +31,45 @@ else:
 torch.manual_seed(42)
 np.random.seed(42)
 
-# Define the Matrix Factorization model
-class MatrixFactorization(nn.Module):
-    def __init__(self, num_users, num_items, embedding_dim=100):
-        super(MatrixFactorization, self).__init__()
-        self.user_embedding = nn.Embedding(num_users, embedding_dim)
-        self.item_embedding = nn.Embedding(num_items, embedding_dim)
-        self.user_bias = nn.Embedding(num_users, 1)
-        self.item_bias = nn.Embedding(num_items, 1)
-        self.global_bias = nn.Parameter(torch.tensor([0.0]))
+class NeuralMF(nn.Module):
+    def __init__(self, num_users, num_items, embedding_dim=100, hidden_layers=[64, 32, 16], dropout_p=0.3):
+        super(NeuralMF, self).__init__()
+        self.user_embedding_gmf = nn.Embedding(num_users, embedding_dim)
+        self.item_embedding_gmf = nn.Embedding(num_items, embedding_dim)
 
-        # Initialize the embeddings
-        self.user_embedding.weight.data.uniform_(-0.1, 0.1)
-        self.item_embedding.weight.data.uniform_(-0.1, 0.1)
+        self.user_embedding_mlp = nn.Embedding(num_users, embedding_dim)
+        self.item_embedding_mlp = nn.Embedding(num_items, embedding_dim)
+
+        mlp_input_size = embedding_dim * 2
+        mlp_layers = []
+        for hidden in hidden_layers:
+            mlp_layers.append(nn.Linear(mlp_input_size, hidden))
+            mlp_layers.append(nn.ReLU())
+            mlp_layers.append(nn.Dropout(p=dropout_p))  
+            mlp_input_size = hidden
+        self.mlp = nn.Sequential(*mlp_layers)
+
+        self.output_layer = nn.Linear(hidden_layers[-1] + embedding_dim, 1)
 
     def forward(self, user_indices, item_indices):
-        user_embeds = self.user_embedding(user_indices)
-        item_embeds = self.item_embedding(item_indices)
-        dot = (user_embeds * item_embeds).sum(1)
-        bias = self.user_bias(user_indices).squeeze() + self.item_bias(item_indices).squeeze() + self.global_bias
-        return dot + bias
+        # GMF part
+        user_embed_gmf = self.user_embedding_gmf(user_indices)
+        item_embed_gmf = self.item_embedding_gmf(item_indices)
+        gmf = user_embed_gmf * item_embed_gmf
+
+        # MLP part
+        user_embed_mlp = self.user_embedding_mlp(user_indices)
+        item_embed_mlp = self.item_embedding_mlp(item_indices)
+        mlp_input = torch.cat([user_embed_mlp, item_embed_mlp], dim=-1)
+        mlp_output = self.mlp(mlp_input)
+
+        # Combine GMF + MLP parts
+        concat = torch.cat([gmf, mlp_output], dim=-1)
+        prediction = self.output_layer(concat)
+
+        return prediction.squeeze()
+
+
     
 # Define the dataset class
 class RatingDataset(Dataset):
@@ -113,7 +133,7 @@ def get_indices(df):
     iid2idx = {iid: idx for idx, iid in enumerate(df['item_id'].unique())}
     return uid2idx, iid2idx
 
-def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=10, patience=3):
+def train_model(model, model_path, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs=10, patience=3):
     best_val_loss = float('inf')
     counter = 0
 
@@ -164,7 +184,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         end_time = time.time()
         print(f"Epoch {epoch+1}/{num_epochs} - LR: {current_lr:.6f} - Train RMSE: {train_rmse:.4f} - Val RMSE: {val_rmse:.4f} - Time: {end_time - start_time:.2f}s")
 
-        model_save_path = os.path.join(root_path, "models", "mf", "mf_model.pth")
+        model_save_path = model_path
         # Early Stopping Check
         if val_rmse < best_val_loss:
             best_val_loss = val_rmse
@@ -219,16 +239,18 @@ print(f"Number of validation samples: {len(valid_dataset)}")
 # ---------------------------------------------------------------------------
 
 # Initialize the model, loss function, and optimizer
+embedding_dim = 96
 num_users = df.user_id.nunique()
 num_items = df.item_id.nunique()
-model = MatrixFactorization(num_users, num_items, embedding_dim=100).to(device)
+model = NeuralMF(num_users, num_items).to(device)
 print("model initialized with {} users and {} items.".format(num_users, num_items))
 
 criterion = nn.MSELoss()
 optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
 
-iterations_per_epoch = len(train_loader)
-step_size_val = 4 * iterations_per_epoch
+num_batches = len(train_loader)
+# step_size_val = (num_batches * 2)//3  
+step_size_val = 2 * num_batches
 
 scheduler = CyclicLR(
     optimizer, 
@@ -240,7 +262,7 @@ scheduler = CyclicLR(
 )
 
 # load an existing model if available
-model_path = os.path.join(root_path, "models", "mf", "mf_model.pth")
+model_path = os.path.join(root_path, "models", "ncf", f"mlp_drp_out.pth")
 try:
     model.load_state_dict(torch.load(model_path))
     print(f"Successfully loaded weights from {model_path}")
@@ -252,7 +274,7 @@ except Exception as e:
 
 # Train the model
 print("Starting training...")
-trained_model = train_model(model, train_loader, valid_loader, criterion, optimizer, scheduler, num_epochs=100, patience=5)
+trained_model = train_model(model, model_path, train_loader, valid_loader, criterion, optimizer, scheduler, num_epochs=100, patience=5)
 
 
 valid_df['rating'].mean(), valid_df['rating'].std()
